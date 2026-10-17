@@ -1,8 +1,82 @@
 # Research: opencode TUI hangs when the notification plugin is loaded
 
-**Date:** 2026-09-23
+**Date:** 2026-09-23 (V1 investigation) · **Updated:** 2026-10-17 (V2 migration)
 **Environment:** opencode 1.18.29 (single-file compiled binary `/usr/bin/opencode`), Linux, Bun shell available to plugins.
 **Scope:** `.opencode/plugins/note-on-idle.js` — the "desktop notification on question / waiting for prompt" plugin.
+
+---
+
+## 0. Update 2026-10-17 — opencode v2 plugin migration
+
+The rest of this document is the original 1.18.x investigation and is kept as-is.
+
+opencode moved to **v2** (running `2.0.31` here) and the **plugin API is one of
+the three intentional breaking changes**. The old entrypoint no longer loads:
+
+```
+Plugin must export a default definition with an id and an effect or setup function.
+```
+
+Mapping that was applied to `.opencode/plugins/note-on-idle.js`:
+
+| V1 | V2 |
+| --- | --- |
+| `export const NoteOnIdle = async ({ client }) => ({ … })` | `export default { id: "note-on-idle", setup(ctx) { … } }` |
+| returned `event` hook | `ctx.event.subscribe({ signal })`, aborted by the cleanup returned from `setup` |
+| returned `tool.execute.before` | `ctx.tool.hook("execute.before", cb)` |
+| `event` hook listening for `session.idle` | `session.execution.succeeded` / `.failed` |
+| `event.properties` | `event.data` |
+| `permission` detail field | `action` |
+| `client.app.log()` | file log (see below) |
+
+### 0.1 Two silent breakages found while porting
+
+The loader error was the obvious half. Two more things the v1 file depended on
+no longer exist in v2, and **neither one produces an error** — the plugin loads
+and then quietly does nothing:
+
+1. **`session.idle` is never published.** The event schema still exists in the
+   binary, so a naive port type-checks and loads, but it never fires. A
+   finished turn is `session.execution.succeeded`
+   (data `{ sessionID }`) or `session.execution.failed`
+   (data `{ sessionID, error: { type, message } }`). Caught by subscribing to
+   the live `/api/event` stream and recording what v2 actually emits; the
+   opencode log records nothing for these events, so grepping the log proves
+   nothing here.
+2. **There is no logging API.** `ctx.app` only carries `version`, there is no
+   `/api/log` route, and the background service sends stdout to `/dev/null`
+   (`/proc/<server-pid>/fd/1 -> /dev/null`), so `console.log` is invisible in
+   the configuration that matters. Debug lines are appended to
+   `~/.local/state/opencode/note-on-idle.log` with `appendFileSync` in a
+   `try/catch`.
+
+### 0.2 Notes worth keeping
+
+- Everything in §5 still applies — no hook awaits anything, `notify-send` is
+  spawned via `Bun.spawn`, 2.5 s debounce unchanged.
+- `Plugin.define` from `@opencode/plugin` is **not** required. The loader only
+  validates the default export's shape at runtime (`{ id, setup|effect }`), so
+  the plugin stays dependency-free. Verified in the compiled binary: the schema
+  is `default: { id: string, effect: fn } | { id: string, setup: fn }`.
+- `setup(ctx)` must stay **synchronous** and return the cleanup function; an
+  `async setup` returns a Promise, so the abort would be dropped.
+- `opencode` now watches plugin files and hot-reloads them, so the §7 rule
+  "restart after any plugin change" is no longer strictly required (§7 is kept
+  verbatim for the V1 record; the current rule lives in `AGENTS.md`).
+- The stale V1 `@opencode-ai/plugin` installs were removed from `.opencode/`
+  and `~/.config/opencode/`; the plugin imports nothing.
+
+### 0.3 Verification
+
+Stubbed harness for the wiring (debounce, `event.data` extraction, missing-`app`
+ctx, cleanup function), then live:
+
+- `opencode run --model opencode/<model> "reply with exactly: ok"` finishing →
+  real desktop notification, and `sent notification {"reason":"session.execution.succeeded"}`
+  in the debug log.
+- `question` tool call mid-turn → real notification.
+- `grep note-on-idle ~/.local/share/opencode/log/opencode.log` → `loading plugin`
+  with no following `failed to load plugin`.
 
 ---
 
